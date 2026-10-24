@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>RemoteDesk</title>
+<style>
+  :root { color-scheme: dark; --bg:#0f1115; --fg:#e8eaed; --mut:#8b93a1; --acc:#4c8dff; --card:#1a1d24; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:15px/1.4 system-ui,-apple-system,Segoe UI,sans-serif; overflow:hidden;
+    overscroll-behavior:none; -webkit-user-select:none; user-select:none; -webkit-touch-callout:none; }
+  #login { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; padding:16px; }
+  #login form { background:var(--card); padding:24px; border-radius:14px; width:100%; max-width:340px;
+    display:flex; flex-direction:column; gap:12px; }
+  h1 { margin:0 0 4px; font-size:20px; }
+  input[type=password] { padding:12px; border-radius:8px; border:1px solid #333a46; background:#11141a;
+    color:var(--fg); font-size:16px; -webkit-user-select:text; user-select:text; }
+  button { padding:11px 14px; border:0; border-radius:8px; background:var(--acc); color:#fff; font-size:15px; }
+  #err { color:#ff7b7b; min-height:1.2em; margin:0; }
+  #screen { position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:#000; }
+  canvas { max-width:100%; max-height:100%; touch-action:none; cursor:default; }
+  #bar { position:fixed; left:50%; transform:translateX(-50%); bottom:calc(8px + env(safe-area-inset-bottom));
+    display:flex; gap:6px; padding:6px; background:rgba(26,29,36,.92); border-radius:12px; flex-wrap:wrap;
+    justify-content:center; max-width:96vw; transition:opacity .2s; }
+  #bar.min { opacity:.25; }
+  #bar button { background:#2a2f3a; padding:8px 11px; font-size:14px; min-width:42px; }
+  #bar button.on { background:var(--acc); }
+  #kb { position:fixed; left:-100px; top:0; width:1px; height:1px; opacity:0; font-size:16px; }
+  #status { position:fixed; top:8px; left:8px; font-size:12px; color:var(--mut); pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="login">
+  <form id="f">
+    <h1>RemoteDesk</h1>
+    <input id="pw" type="password" placeholder="Password" autocomplete="current-password" autofocus>
+    <button type="submit">Sambung</button>
+    <p id="err"></p>
+  </form>
+</div>
+
+<div id="screen">
+  <canvas id="cv"></canvas>
+  <div id="status"></div>
+  <div id="bar">
+    <button id="bKb">⌨</button>
+    <button data-k="Escape">Esc</button>
+    <button data-k="Tab">Tab</button>
+    <button data-m="ControlLeft">Ctrl</button>
+    <button data-m="AltLeft">Alt</button>
+    <button data-m="MetaLeft">Win</button>
+    <button data-k="ArrowUp">↑</button>
+    <button data-k="ArrowDown">↓</button>
+    <button data-k="ArrowLeft">←</button>
+    <button data-k="ArrowRight">→</button>
+    <button id="bFs">⛶</button>
+    <button id="bHide">▾</button>
+  </div>
+  <input id="kb" autocapitalize="off" autocomplete="off" autocorrect="off" spellcheck="false">
+</div>
+
+<script>
+"use strict";
+const $ = (s) => document.querySelector(s);
+const cv = $("#cv"), ctx = cv.getContext("2d", { alpha: false });
+let ws = null, ready = false, frames = 0, bytes = 0;
+
+// ---------- connection ----------
+$("#f").addEventListener("submit", (e) => { e.preventDefault(); connect($("#pw").value); });
+
+let decoder = null, needKey = true, ts = 0;
+
+function setupVp8() {
+  needKey = true;
+  decoder = new VideoDecoder({
+    output: (f) => { ctx.drawImage(f, 0, 0, cv.width, cv.height); f.close(); },
+    error: () => { needKey = true; try { decoder.close(); } catch (_) {} setupVp8(); },
+  });
+  decoder.configure({ codec: "vp8", optimizeForLatency: true });
+}
+
+function onFrame(buf) {
+  const a = new Uint8Array(buf);
+  bytes += a.length; frames++;
+  if (decoder) {
+    const key = a[0] === 1;
+    if (needKey && !key) return;
+    needKey = false;
+    ts += 33333;
+    try { decoder.decode(new EncodedVideoChunk({ type: key ? "key" : "delta", timestamp: ts, data: a.subarray(1) })); }
+    catch (_) { needKey = true; }
+  } else {
+    createImageBitmap(new Blob([a.subarray(1)], { type: "image/jpeg" }))
+      .then((bmp) => { ctx.drawImage(bmp, 0, 0, cv.width, cv.height); bmp.close(); }).catch(() => {});
+  }
+}
+
+async function connect(pw) {
+  $("#err").textContent = "";
+  ws = new WebSocket(`wss://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => ws.send(JSON.stringify({ t: "auth", pw }));
+  ws.onmessage = async (ev) => {
+    if (typeof ev.data !== "string") { if (ready) onFrame(ev.data); return; }
+    const m = JSON.parse(ev.data);
+    if (m.t === "err") { $("#err").textContent = "Password salah."; return; }
+    if (m.t !== "ok") return;
+    if (m.codec === "vp8") {
+      const ok = window.VideoDecoder && (await VideoDecoder.isConfigSupported({ codec: "vp8" })).supported;
+      if (!ok) {
+        $("#err").textContent = "Browser ini tidak mendukung VP8 (WebCodecs). Jalankan host dengan --codec jpeg.";
+        ws.close(); return;
+      }
+      setupVp8();
+    } else decoder = null;
+    cv.width = m.w; cv.height = m.h; ready = true;
+    $("#login").style.display = "none"; $("#screen").style.display = "flex";
+  };
+  ws.onclose = () => {
+    if (decoder) { try { decoder.close(); } catch (_) {} decoder = null; }
+    if (ready) { ready = false; $("#screen").style.display = "none"; $("#login").style.display = "flex";
+      $("#err").textContent = "Koneksi terputus."; }
+    else if (!$("#err").textContent) $("#err").textContent = "Tidak bisa tersambung.";
+  };
+}
+setInterval(() => {
+  $("#status").textContent = ready ? `${frames} fps · ${(bytes * 8 / 1e6).toFixed(1)} Mbit/s` : "";
+  frames = 0; bytes = 0;
+}, 1000);
+
+const send = (o) => { if (ready && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+// ---------- pointer helpers ----------
+const norm = (cx, cy) => {
+  const r = cv.getBoundingClientRect();
+  return { x: Math.min(1, Math.max(0, (cx - r.left) / r.width)), y: Math.min(1, Math.max(0, (cy - r.top) / r.height)) };
+};
+let pend = null;
+function queueMove(cx, cy) {
+  const first = pend === null;
+  pend = norm(cx, cy);
+  if (first) requestAnimationFrame(() => { send({ t: "m", ...pend }); pend = null; });
+}
+function flushMove(cx, cy) { pend = null; send({ t: "m", ...norm(cx, cy) }); }
+
+// ---------- mouse ----------
+cv.addEventListener("mousemove", (e) => queueMove(e.clientX, e.clientY));
+cv.addEventListener("mousedown", (e) => { flushMove(e.clientX, e.clientY); send({ t: "b", b: e.button, d: 1 }); e.preventDefault(); });
+window.addEventListener("mouseup", (e) => { if (ready) send({ t: "b", b: e.button, d: 0 }); });
+cv.addEventListener("contextmenu", (e) => e.preventDefault());
+let wacc = 0, wacch = 0;
+cv.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const k = e.deltaMode === 1 ? 33 : 100;
+  wacc += e.deltaY / k; wacch += e.deltaX / k;
+  const dy = Math.trunc(wacc), dx = Math.trunc(wacch);
+  if (dy || dx) { wacc -= dy; wacch -= dx; send({ t: "w", dx, dy }); }
+}, { passive: false });
+
+// ---------- keyboard ----------
+const down = new Set();
+window.addEventListener("keydown", (e) => {
+  if (!ready || e.target === kb) return;
+  e.preventDefault(); down.add(e.code); send({ t: "k", c: e.code, d: 1 }); releaseSticky();
+});
+window.addEventListener("keyup", (e) => {
+  if (!ready || e.target === kb) return;
+  e.preventDefault(); down.delete(e.code); send({ t: "k", c: e.code, d: 0 });
+});
+window.addEventListener("blur", () => { for (const c of down) send({ t: "k", c, d: 0 }); down.clear(); });
+
+// ---------- touch ----------
+let tStart = null, lastTap = { t: 0, x: 0, y: 0 }, dragging = false, lpTimer = null, scrollY = 0, scrollX = 0, lastMid = null;
+const mid = (ts) => ({ x: (ts[0].clientX + ts[1].clientX) / 2, y: (ts[0].clientY + ts[1].clientY) / 2 });
+cv.addEventListener("touchstart", (e) => {
+  e.preventDefault();
+  clearTimeout(lpTimer);
+  if (e.touches.length === 2) { lastMid = mid(e.touches); tStart = null; return; }
+  const t = e.touches[0];
+  tStart = { x: t.clientX, y: t.clientY, time: Date.now(), moved: false };
+  flushMove(t.clientX, t.clientY);
+  const nearTap = Date.now() - lastTap.t < 350 && Math.hypot(t.clientX - lastTap.x, t.clientY - lastTap.y) < 30;
+  if (nearTap) { dragging = true; send({ t: "b", b: 0, d: 1 }); }
+  else lpTimer = setTimeout(() => {
+    if (tStart && !tStart.moved) { send({ t: "b", b: 2, d: 1 }); send({ t: "b", b: 2, d: 0 }); tStart.done = true; navigator.vibrate?.(20); }
+  }, 550);
+}, { passive: false });
+cv.addEventListener("touchmove", (e) => {
+  e.preventDefault();
+  if (e.touches.length === 2 && lastMid) {
+    const m = mid(e.touches);
+    scrollY += (lastMid.y - m.y) / 30; scrollX += (lastMid.x - m.x) / 30; lastMid = m;
+    const dy = Math.trunc(scrollY), dx = Math.trunc(scrollX);
+    if (dy || dx) { scrollY -= dy; scrollX -= dx; send({ t: "w", dx, dy }); }
+    return;
+  }
+  if (!tStart) return;
+  const t = e.touches[0];
+  if (Math.hypot(t.clientX - tStart.x, t.clientY - tStart.y) > 8) { tStart.moved = true; clearTimeout(lpTimer); }
+  queueMove(t.clientX, t.clientY);
+}, { passive: false });
+cv.addEventListener("touchend", (e) => {
+  e.preventDefault();
+  clearTimeout(lpTimer);
+  if (dragging) { send({ t: "b", b: 0, d: 0 }); dragging = false; tStart = null; return; }
+  if (e.touches.length === 0 && tStart && !tStart.moved && !tStart.done && Date.now() - tStart.time < 300) {
+    send({ t: "b", b: 0, d: 1 }); send({ t: "b", b: 0, d: 0 });
+    lastTap = { t: Date.now(), x: tStart.x, y: tStart.y };
+  }
+  if (e.touches.length === 0) { tStart = null; lastMid = null; }
+}, { passive: false });
+
+// ---------- toolbar + on-screen keyboard ----------
+const kb = $("#kb");
+const sticky = new Set();
+function releaseSticky() { for (const c of sticky) send({ t: "k", c, d: 0 }); sticky.clear();
+  document.querySelectorAll("[data-m]").forEach((b) => b.classList.remove("on")); }
+$("#bKb").onclick = () => { kb.focus(); };
+document.querySelectorAll("[data-k]").forEach((b) => b.onclick = () => {
+  send({ t: "k", c: b.dataset.k, d: 1 }); send({ t: "k", c: b.dataset.k, d: 0 }); releaseSticky(); });
+document.querySelectorAll("[data-m]").forEach((b) => b.onclick = () => {
+  const c = b.dataset.m, on = !sticky.has(c);
+  send({ t: "k", c, d: on ? 1 : 0 }); on ? sticky.add(c) : sticky.delete(c); b.classList.toggle("on", on); });
+$("#bFs").onclick = () => { const el = document.documentElement;
+  document.fullscreenElement ? document.exitFullscreen() : (el.requestFullscreen || el.webkitRequestFullscreen)?.call(el); };
+$("#bHide").onclick = () => $("#bar").classList.toggle("min");
+
+kb.addEventListener("beforeinput", (e) => {
+  e.preventDefault();
+  if (e.inputType === "insertText" && e.data) send({ t: "u", s: e.data });
+  else if (e.inputType === "insertLineBreak" || e.inputType === "insertParagraph") { send({ t: "k", c: "Enter", d: 1 }); send({ t: "k", c: "Enter", d: 0 }); }
+  else if (e.inputType.startsWith("deleteContent")) { send({ t: "k", c: "Backspace", d: 1 }); send({ t: "k", c: "Backspace", d: 0 }); }
+  releaseSticky();
+});
+kb.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" || e.key === "Backspace") return; // handled in beforeinput on mobile; desktop falls back below
+  if (e.key.length > 1) { e.preventDefault(); send({ t: "k", c: e.code, d: 1 }); send({ t: "k", c: e.code, d: 0 }); }
+});
+</script>
+</body>
+</html>
